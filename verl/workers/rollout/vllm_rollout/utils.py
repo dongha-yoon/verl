@@ -19,6 +19,7 @@ import platform
 import signal
 import threading
 from collections.abc import Mapping
+from contextlib import nullcontext
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
 
@@ -29,6 +30,7 @@ from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches, is_fp8_model, load_quanted_weights
+from verl.workers.rollout.vllm_rollout.nccl_m2n_weight_loader import use_local_tp_weight_loaders
 from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
 
 logger = logging.getLogger(__file__)
@@ -229,8 +231,24 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
-        """Update the weights of the rollout model."""
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        weights_are_tp_sharded: bool = False,
+    ):
+        """Receive IPC buckets and update the rollout model.
+
+        Args:
+            peft_config: Optional LoRA configuration accompanying adapter tensors.
+            base_sync_done: Whether the base-model synchronization for an adapter
+                update has already completed.
+            use_shm: Use host shared memory instead of CUDA IPC for bucket transport.
+            weights_are_tp_sharded: Treat parameter tensors as already local to
+                this vLLM worker's TP rank. Quantized base-model updates require
+                rollout TP1, where every received tensor is complete.
+        """
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
         if self.device is None:
@@ -249,6 +267,15 @@ class vLLMColocateWorkerExtension:
 
             for model in self._iter_all_models():
                 restore_moe_expert_maps(model)
+
+        if weights_are_tp_sharded:
+            if (peft_config and base_sync_done) or self._is_qat_model or self._is_modelopt_qat:
+                raise NotImplementedError("TP-local NCCL M2N loading does not support LoRA, QAT, or ModelOpt QAT")
+            if (
+                is_fp8_model(self.model_runner.vllm_config)
+                and self.model_runner.vllm_config.parallel_config.tensor_parallel_size != 1
+            ):
+                raise NotImplementedError("quantized NCCL M2N loading requires rollout TP1")
 
         if self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
@@ -305,6 +332,7 @@ class vLLMColocateWorkerExtension:
                 weights,
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
+                weights_are_tp_sharded=weights_are_tp_sharded,
             )
 
         receiver.receive_weights(on_bucket_received=on_bucket_received)
@@ -353,7 +381,19 @@ class vLLMColocateWorkerExtension:
         weights: list[tuple[str, torch.Tensor]],
         peft_config: dict,
         base_sync_done: bool,
+        weights_are_tp_sharded: bool = False,
     ):
+        """Apply one received bucket according to its model and sharding format.
+
+        Args:
+            weights: Named parameter and buffer tensors from the IPC receiver.
+            peft_config: Optional LoRA configuration for adapter updates.
+            base_sync_done: Whether an adapter update may assume base weights are
+                already synchronized.
+            weights_are_tp_sharded: Whether parameter tensors are already sliced
+                for the current vLLM TP rank.
+        """
+
         if peft_config and base_sync_done:
             # Clone out of the receiver's reused IPC bucket buffer: add_lora keeps these tensors
             # past this callback, so views into the freed/overwritten buffer crash later (#6454).
@@ -384,13 +424,19 @@ class vLLMColocateWorkerExtension:
                 )
             else:
                 if param_updates:
-                    for model in self._iter_all_models():
-                        if peft_config is None:
-                            model.load_weights(param_updates)
-                        else:
-                            names = {n for n, _ in model.named_parameters(remove_duplicate=False)}
-                            names.update(n for n, _ in model.named_buffers())
-                            model.load_weights((resolve_weight_name(model, n, names), t) for n, t in param_updates)
+                    models = list(self._iter_all_models())
+                    # TP-local tensors must not be sliced again by vLLM's normal loaders.
+                    load_context = (
+                        use_local_tp_weight_loaders(iter(models)) if weights_are_tp_sharded else nullcontext()
+                    )
+                    with load_context:
+                        for model in models:
+                            if peft_config is None:
+                                model.load_weights(param_updates)
+                            else:
+                                names = {n for n, _ in model.named_parameters(remove_duplicate=False)}
+                                names.update(n for n, _ in model.named_buffers())
+                                model.load_weights((resolve_weight_name(model, n, names), t) for n, t in param_updates)
                 loaded_buffers = self._apply_buffer_updates_all_models(buffer_updates, named_buffers)
                 logger.info(
                     f"Loading standard weights (non-FP8, async), "

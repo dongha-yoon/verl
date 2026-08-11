@@ -213,16 +213,34 @@ class ServerAdapter(BaseRollout):
         wire_format: str = "named_tensors",
         **kwargs,
     ):
-        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
-        assert wire_format == "named_tensors", (
-            f"vLLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
-        )
+        """Update inference workers through CUDA IPC or shared-memory fallback.
+
+        Args:
+            weights: Named tensors produced by the checkpoint engine.
+            global_steps: Optional trainer step associated with this update.
+            wire_format: ``"named_tensors"`` for global tensors handled by normal
+                vLLM loaders, or ``"rank_local_named_tensors"`` for tensors that
+                M2N has already partitioned for each destination worker.
+            **kwargs: Additional update options forwarded to the vLLM worker.
+
+        Raises:
+            ValueError: If vLLM does not support the checkpoint wire format.
+        """
+
+        if wire_format not in ("named_tensors", "rank_local_named_tensors"):
+            raise ValueError(f"unsupported vLLM checkpoint wire format: {wire_format!r}")
         start_time = time.time()
 
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
+            kwargs={
+                **kwargs,
+                "use_shm": self.use_shm,
+                # vLLM interprets the backend's generic rank-local shards as
+                # tensors already partitioned for this worker's TP rank.
+                "weights_are_tp_sharded": wire_format == "rank_local_named_tensors",
+            },
         )
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes

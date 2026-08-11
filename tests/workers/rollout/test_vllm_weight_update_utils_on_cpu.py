@@ -36,6 +36,18 @@ apply_buffer_updates = _weight_update_utils.apply_buffer_updates
 split_buffer_updates = _weight_update_utils.split_buffer_updates
 
 
+def _load_nccl_m2n_weight_loader():
+    module_path = _REPO_ROOT / "verl/workers/rollout/vllm_rollout/nccl_m2n_weight_loader.py"
+    spec = importlib.util.spec_from_file_location("nccl_m2n_weight_loader", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_nccl_m2n_weight_loader = _load_nccl_m2n_weight_loader()
+
+
 def _load_vllm_rollout_utils():
     """Load vllm_rollout/utils.py with heavyweight deps stubbed.
 
@@ -92,6 +104,7 @@ def _load_vllm_rollout_utils():
         "verl.utils.vllm.patch": fake_vllm_patch,
         "verl.utils.vllm.vllm_quant_utils": fake_vllm_quant,
         "verl.plugin.platform": fake_platform,
+        "verl.workers.rollout.vllm_rollout.nccl_m2n_weight_loader": _nccl_m2n_weight_loader,
         "verl.workers.rollout.vllm_rollout.weight_update_utils": _weight_update_utils,
     }
 
