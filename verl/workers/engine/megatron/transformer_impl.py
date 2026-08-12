@@ -1106,6 +1106,94 @@ class MegatronEngine(BaseEngine):
         gen, _ = self.get_per_tensor_param_shard()
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
+    def get_nccl_m2n_rank_layout(self):
+        """Expose Megatron tensor ownership without coupling transport to Megatron."""
+
+        if mpu.get_context_parallel_world_size() != 1:
+            raise NotImplementedError("local Megatron NCCL M2N export currently requires CP1")
+        if mpu.get_pipeline_model_parallel_world_size() == mpu.get_expert_model_parallel_world_size() == 1:
+            return None
+        return {
+            "pp": mpu.get_pipeline_model_parallel_rank(),
+            "pp_size": mpu.get_pipeline_model_parallel_world_size(),
+            "ep": mpu.get_expert_model_parallel_rank(),
+            "ep_size": mpu.get_expert_model_parallel_world_size(),
+            "etp": mpu.get_expert_tensor_parallel_rank(),
+            "etp_size": mpu.get_expert_tensor_parallel_world_size(),
+            "tp": mpu.get_tensor_model_parallel_rank(),
+            "tp_size": mpu.get_tensor_model_parallel_world_size(),
+            "edp": mpu.get_expert_data_parallel_rank(),
+        }
+
+    def get_per_tensor_param_nccl_m2n(self, **kwargs):
+        """Yield final HF-named owner-local shards without TP/EP tensor gathers."""
+
+        del kwargs
+        if self.peft_cls is not None or self._qat_enabled:
+            raise NotImplementedError("Megatron NCCL M2N does not support LoRA or QAT")
+
+        from verl.checkpoint_engine.nccl_m2n_checkpoint_engine import NCCLM2NLocalWeight
+
+        from .nccl_m2n_export import export_local_nccl_m2n_weights
+
+        rank_layout = self.get_nccl_m2n_rank_layout()
+        if not self.vanilla_bridge:
+            from .bridge_nccl_m2n_export import BridgeNCCLM2NExport
+
+            config = self.model_config.hf_config
+            if getattr(self, "_bridge_nccl_m2n_export", None) is None:
+                # Every trainer participates in Bridge's one-time PP parameter-
+                # directory exchange, including inactive expert-data replicas.
+                self._bridge_nccl_m2n_export = BridgeNCCLM2NExport(
+                    self.bridge,
+                    self.module,
+                    ep_rank=mpu.get_expert_model_parallel_rank(),
+                    ep_size=mpu.get_expert_model_parallel_world_size(),
+                    num_experts=getattr(config, "num_experts", getattr(config, "n_routed_experts", 0)),
+                )
+            exported_weights = self._bridge_nccl_m2n_export.weights()
+        else:
+            exported_weights = export_local_nccl_m2n_weights(self.bridge, self.module)
+
+        active_owner = rank_layout is None or mpu.get_expert_data_parallel_rank() == 0
+        if active_owner:
+            load_megatron_model_to_gpu(self.module, load_grad=False, load_frozen_params=True)
+
+        dense_tp_size = int(mpu.get_tensor_model_parallel_world_size())
+        dense_tp_rank = int(mpu.get_tensor_model_parallel_rank())
+        expert_tp_size = int(mpu.get_expert_tensor_parallel_world_size())
+        expert_tp_rank = int(mpu.get_expert_tensor_parallel_rank())
+        source_mesh_dims = None if rank_layout is not None else (int(self.get_data_parallel_size()), dense_tp_size)
+
+        def _weights():
+            for weight in exported_weights:
+                if weight.source_shard_dim is not None:
+                    expected_size = expert_tp_size if weight.expert_ids is not None else dense_tp_size
+                    expected_rank = expert_tp_rank if weight.expert_ids is not None else dense_tp_rank
+                    if expected_size != weight.source_shard_size:
+                        raise ValueError(
+                            f"Megatron shard size={expected_size}, export reports "
+                            f"{weight.source_shard_size} for {weight.name}"
+                        )
+                    if expected_rank != weight.source_shard_rank:
+                        raise ValueError(
+                            f"Megatron shard rank={expected_rank}, export reports "
+                            f"{weight.source_shard_rank} for {weight.name}"
+                        )
+                yield NCCLM2NLocalWeight(
+                    name=weight.name,
+                    tensor=weight.tensor,
+                    global_shape=weight.global_shape,
+                    destination_shard_dim=weight.destination_shard_dim,
+                    source_shard_dim=weight.source_shard_dim,
+                    source_shard_size=weight.source_shard_size,
+                    source_mesh_dims=source_mesh_dims,
+                    source_shard_rank=weight.source_shard_rank,
+                    expert_ids=weight.expert_ids,
+                )
+
+        return _weights(), None
+
     def disable_adapter(self) -> ContextManager:
         return self.peft_cls.disable_adapter(self.module)
 

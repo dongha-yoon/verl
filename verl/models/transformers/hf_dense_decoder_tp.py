@@ -34,6 +34,6 @@ def infer_dense_decoder_tp_shard_dim(name: str) -> int | None:
         return 0
     if name.endswith(("self_attn.o_proj.weight", "mlp.down_proj.weight")):
         return 1
-    if name.endswith("norm.weight"):
+    if name.endswith(("norm.weight", "mlp.gate.weight")):
         return None
     raise NotImplementedError(f"unvalidated dense-decoder TP parameter: {name}")

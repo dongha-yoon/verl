@@ -188,7 +188,8 @@ class BaseEngine:
         this export must already be representable as an NCCL M2N source layout.
 
         Returns:
-            Generator: A generator yielding ``(name, local_shard, ShardSpec)``.
+            Generator: A generator yielding either ``LocalWeightDesc`` objects
+                or ``(name, local_shard, ShardSpec)`` tuples.
             Optional[dict]: Optional PEFT configuration.
         """
         raise NotImplementedError
