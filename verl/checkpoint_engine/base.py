@@ -109,8 +109,15 @@ class CheckpointEngine(ABC):
 
     # How receive_weights yields weights to the server adapter:
     #   "named_tensors" -- (name, tensor) pairs, bucketed into full-tensor loads.
+    #   "rank_local_named_tensors" -- (name, tensor) pairs already sharded for each destination rank.
     #   "delta_flush"   -- per-flush sparse payloads applied via a custom loader.
     wire_format = "named_tensors"
+
+    @classmethod
+    def is_master_rank(cls, trainer_rank: int, **engine_kwargs) -> bool:
+        """Return whether a trainer rank owns transport bootstrap metadata."""
+
+        return trainer_rank == 0
 
     @abstractmethod
     def prepare(self) -> dict[str, Any]:
@@ -303,6 +310,18 @@ class CheckpointEngineWorker(Worker):
 
         self.server_adapter: BaseRollout = server_adapter
         backend = self.rollout_config.checkpoint_engine.backend
+        if backend == "nccl_m2n" and self.rollout_config.name != "vllm":
+            raise NotImplementedError("checkpoint_engine.backend='nccl_m2n' currently requires rollout.name='vllm'")
+        if backend == "nccl_m2n":
+            config = self.rollout_config
+            if config.pipeline_model_parallel_size != 1:
+                raise NotImplementedError("NCCL M2N currently requires rollout PP1")
+            vllm_kwargs = config.engine_kwargs.get("vllm", {})
+            if config.expert_parallel_size > 1 and (
+                vllm_kwargs.get("expert_placement_strategy", "linear") != "linear"
+                or vllm_kwargs.get("enable_eplb", False)
+            ):
+                raise ValueError("direct expert NCCL M2N requires static linear expert placement")
         if backend == "delta_sharded" and self.rollout_config.name != "sglang":
             raise NotImplementedError(
                 f"checkpoint_engine.backend={backend!r} currently supports only the sglang rollout "
@@ -311,7 +330,11 @@ class CheckpointEngineWorker(Worker):
                 "apply interface, planned as a follow-up."
             )
         bucket_size = self.rollout_config.checkpoint_engine.update_weights_bucket_megabytes << 20
-        engine_kwargs = self.rollout_config.checkpoint_engine.engine_kwargs.get(backend, {})
+        engine_kwargs = dict(self.rollout_config.checkpoint_engine.engine_kwargs.get(backend, {}))
+        if backend == "nccl_m2n":
+            engine_kwargs["destination_shard_size"] = self.rollout_config.tensor_model_parallel_size
+            engine_kwargs["destination_expert_parallel_size"] = self.rollout_config.expert_parallel_size
+            engine_kwargs["derive_topology"] = True
         # If custom_backend_module is set, import it so plugins can register
         # in CheckpointEngineRegistry before the backend is instantiated.
         import_external_libs(self.rollout_config.checkpoint_engine.custom_backend_module or None)

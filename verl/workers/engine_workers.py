@@ -673,12 +673,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
             backend = checkpoint_engine_config.backend
             bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
-            engine_kwargs = checkpoint_engine_config.engine_kwargs.get(backend, {})
+            engine_kwargs = dict(checkpoint_engine_config.engine_kwargs.get(backend, {}))
+            if backend == "nccl_m2n" and self.config.actor.strategy == "megatron":
+                rank_layout = getattr(self.actor.engine, "get_nccl_m2n_rank_layout", None)
+                if rank_layout is not None:
+                    engine_kwargs["source_layout"] = rank_layout()
             # If custom_backend_module is set, import it so plugins can register
             # in CheckpointEngineRegistry before the backend is instantiated.
             import_external_libs(checkpoint_engine_config.custom_backend_module or None)
+            backend_cls = CheckpointEngineRegistry.get(backend)
+            trainer_rank = torch.distributed.get_rank()
             self.checkpoint_engine = CheckpointEngineRegistry.new(
-                backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
+                backend,
+                is_master=backend_cls.is_master_rank(trainer_rank, **engine_kwargs),
+                bucket_size=bucket_size,
+                **engine_kwargs,
             )
 
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
@@ -753,7 +762,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # snapshot prime), so it drives the training engine itself.
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
                 return metrics or {}
-            per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+            if effective_mode == "nccl_m2n":
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param_nccl_m2n()
+            else:
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
             metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
             return metrics or {}
 

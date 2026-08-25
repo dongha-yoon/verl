@@ -62,6 +62,10 @@ SGLANG_REQUIRES = [
 TRL_REQUIRES = ["trl<=0.9.6"]
 # Keep the legacy mbridge dependency available during its deprecation window.
 MCORE_REQUIRES = ["megatron-bridge", "mbridge"]
+# Keep the base extra CUDA-neutral for images that already provide CUDA Python
+# and NCCL. Users who need those runtime packages can select nccl-extensions'
+# mutually exclusive ``cu12`` or ``cu13`` extra directly.
+NCCL_M2N_REQUIRES = ["nccl-extensions==0.1.0"]
 
 extras_require = {
     "test": TEST_REQUIRES,
@@ -73,6 +77,7 @@ extras_require = {
     "sglang": SGLANG_REQUIRES,
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
+    "nccl_m2n": NCCL_M2N_REQUIRES,
     "trtllm": TRTLLM_REQUIRES,
 }
 

@@ -180,6 +180,19 @@ class BaseEngine:
         """
         raise NotImplementedError
 
+    def get_per_tensor_param_nccl_m2n(self, **kwargs) -> tuple[Generator, Optional[dict]]:
+        """Yield final-name rank-local tensors accepted by the NCCL M2N backend.
+
+        Unlike :meth:`get_per_tensor_param_shard`, which may carry
+        backend-specific placement or conversion metadata for the delta engine,
+        this export must already be representable as an NCCL M2N source layout.
+
+        Returns:
+            Generator: A generator yielding ``(name, local_shard, ShardSpec)``.
+            Optional[dict]: Optional PEFT configuration.
+        """
+        raise NotImplementedError
+
     # Host-memory policy for the delta diff base: pinned (cudaHostAlloc) gives a
     # faster H2D on the diff read-back but competes with every other pinned pool
     # on the node; backends whose memory profile makes that competition
