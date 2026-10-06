@@ -1134,26 +1134,21 @@ class MegatronEngine(BaseEngine):
 
         from verl.checkpoint_engine.nccl_m2n_checkpoint_engine import NCCLM2NLocalWeight
 
-        from .nccl_m2n_export import export_local_nccl_m2n_weights
+        from .bridge_nccl_m2n_export import BridgeNCCLM2NExport
 
         rank_layout = self.get_nccl_m2n_rank_layout()
-        if not self.vanilla_bridge:
-            from .bridge_nccl_m2n_export import BridgeNCCLM2NExport
-
-            config = self.model_config.hf_config
-            if getattr(self, "_bridge_nccl_m2n_export", None) is None:
-                # Every trainer participates in Bridge's one-time PP parameter-
-                # directory exchange, including inactive expert-data replicas.
-                self._bridge_nccl_m2n_export = BridgeNCCLM2NExport(
-                    self.bridge,
-                    self.module,
-                    ep_rank=mpu.get_expert_model_parallel_rank(),
-                    ep_size=mpu.get_expert_model_parallel_world_size(),
-                    num_experts=getattr(config, "num_experts", getattr(config, "n_routed_experts", 0)),
-                )
-            exported_weights = self._bridge_nccl_m2n_export.weights()
-        else:
-            exported_weights = export_local_nccl_m2n_weights(self.bridge, self.module)
+        config = self.model_config.hf_config
+        if getattr(self, "_bridge_nccl_m2n_export", None) is None:
+            # Every trainer participates in Bridge's one-time PP parameter-
+            # directory exchange, including inactive expert-data replicas.
+            self._bridge_nccl_m2n_export = BridgeNCCLM2NExport(
+                self.bridge,
+                self.module,
+                ep_rank=mpu.get_expert_model_parallel_rank(),
+                ep_size=mpu.get_expert_model_parallel_world_size(),
+                num_experts=getattr(config, "num_experts", getattr(config, "n_routed_experts", 0)),
+            )
+        exported_weights = self._bridge_nccl_m2n_export.weights()
 
         active_owner = rank_layout is None or mpu.get_expert_data_parallel_rank() == 0
         if active_owner:
